@@ -184,6 +184,48 @@ async def get_leagues() -> Dict[str, Any]:
     }
 
 @mcp.tool()
+async def get_my_team(
+    league_id: Optional[str] = None,
+    week: Optional[int] = None
+) -> Dict[str, Any]:
+    """
+    Get your roster for a specific league (by league_id). If no league_id is provided,
+    this will discover leagues and use the first active one.
+
+    Args:
+        league_id: The Yahoo league ID (e.g., "205238")
+        week: Optional week number. Defaults to current week if omitted.
+
+    Returns:
+        Your roster with player details.
+    """
+    try:
+        # Ensure leagues are known
+        if not league_id:
+            leagues = await fantasy_service.discover_leagues()
+            # Pick first active league
+            league_id = next((lid for lid, info in leagues.items() if info.get('is_active')), None)
+            if not league_id and leagues:
+                league_id = next(iter(leagues.keys()))
+
+        if not league_id:
+            return {"status": "error", "error": "No leagues available to select"}
+
+        # Fetch user's roster
+        roster = await fantasy_service.data_fetcher.get_user_team_roster(league_id, week)
+        return {
+            "status": "success",
+            "league_id": league_id,
+            "week": week,
+            "team_name": roster.get('team_name', 'My Team'),
+            "player_count": len(roster.get('players', [])),
+            "players": roster.get('players', []),
+        }
+    except Exception as e:
+        logger.error(f"Failed to get my team roster: {e}")
+        return {"status": "error", "error": str(e)}
+
+@mcp.tool()
 async def get_optimal_lineup(
     league_id: Optional[str] = None,
     week: Optional[int] = None,

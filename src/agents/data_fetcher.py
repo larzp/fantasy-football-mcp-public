@@ -37,6 +37,7 @@ class APIEndpoint(str, Enum):
     """Yahoo Fantasy Sports API endpoints."""
     USER_LEAGUES = "user_leagues"
     LEAGUE_INFO = "league_info"
+    LEAGUE_TEAMS = "league_teams"
     TEAM_ROSTER = "team_roster"
     TEAM_MATCHUP = "team_matchup"
     PLAYER_INFO = "player_info"
@@ -283,8 +284,14 @@ class DataFetcherAgent:
                 'last_updated': datetime.utcnow().isoformat()
             }
             
-            if roster_data and hasattr(roster_data, 'players'):
-                for player in roster_data.players:
+            if roster_data:
+                if hasattr(roster_data, 'players'):
+                    iterable = roster_data.players
+                elif isinstance(roster_data, list):
+                    iterable = roster_data
+                else:
+                    iterable = []
+                for player in iterable:
                     player_info = await self._transform_yahoo_player(player)
                     roster_info['players'].append(player_info)
             
@@ -302,6 +309,128 @@ class DataFetcherAgent:
         except Exception as e:
             logger.error(f"Error getting roster for team {team_key}: {e}")
             raise
+
+    async def get_league_teams(self, league_key: str) -> List[Dict[str, Any]]:
+        """
+        Get all teams for a league.
+
+        Args:
+            league_key: Yahoo league identifier (can be a numeric ID like '205238' or full key)
+
+        Returns:
+            List of teams with basic info.
+        """
+        cache_key = f"league_teams:{league_key}"
+
+        cached = await self.cache_manager.get(cache_key)
+        if cached is not None:
+            logger.debug(f"Returning cached teams for league {league_key}")
+            return cached
+
+        try:
+            request = APIRequest(
+                endpoint=APIEndpoint.LEAGUE_TEAMS,
+                params={"league_key": league_key}
+            )
+            teams_data = await self._make_api_request(request)
+
+            teams: List[Dict[str, Any]] = []
+            if teams_data:
+                for t in teams_data:
+                    try:
+                        name_val = getattr(t, 'name', 'Unknown')
+                        if isinstance(name_val, (bytes, bytearray)):
+                            try:
+                                name_val = name_val.decode('utf-8', 'ignore')
+                            except Exception:
+                                name_val = str(name_val)
+                        managers_info = []
+                        managers = getattr(t, 'managers', None)
+                        if managers:
+                            for m in managers:
+                                try:
+                                    managers_info.append({
+                                        'guid': getattr(m, 'guid', None) or (m.get('guid') if isinstance(m, dict) else None),
+                                        'manager_id': getattr(m, 'manager_id', None) or (m.get('manager_id') if isinstance(m, dict) else None),
+                                        'nickname': getattr(m, 'nickname', None) or (m.get('nickname') if isinstance(m, dict) else None),
+                                    })
+                                except Exception:
+                                    continue
+
+                        teams.append({
+                            'team_key': getattr(t, 'team_key', None),
+                            'team_id': getattr(t, 'team_id', None) or (getattr(t, 'team_key', '').split('.')[-1] if getattr(t, 'team_key', None) else None),
+                            'name': name_val,
+                            'is_owned_by_current_login': getattr(t, 'is_owned_by_current_login', None),
+                            'managers': managers_info,
+                            'url': getattr(t, 'url', None),
+                            'waiver_priority': getattr(t, 'waiver_priority', None),
+                            'number_of_moves': getattr(t, 'number_of_moves', None),
+                            'number_of_trades': getattr(t, 'number_of_trades', None),
+                        })
+                    except Exception as te:
+                        logger.warning(f"Failed to transform team object: {te}")
+
+            await self.cache_manager.set(
+                cache_key,
+                teams,
+                ttl=timedelta(hours=1),
+                tags=["league_teams", "yahoo_api", f"league:{league_key}"]
+            )
+
+            logger.info(f"Retrieved {len(teams)} teams for league {league_key}")
+            return teams
+        except Exception as e:
+            logger.error(f"Error getting teams for league {league_key}: {e}")
+            raise
+
+    async def get_user_team_key(self, league_key: str) -> Optional[str]:
+        """Identify the current user's team key in the given league."""
+        try:
+            teams = await self.get_league_teams(league_key)
+            if not teams:
+                return None
+
+            import os
+            user_guid = os.getenv('YAHOO_GUID', '')
+
+            # Prefer explicit ownership flag if available
+            for t in teams:
+                if t.get('is_owned_by_current_login') is True:
+                    return t.get('team_key')
+
+            # Fallback: match by GUID in managers
+            if user_guid:
+                for t in teams:
+                    for m in t.get('managers') or []:
+                        if m.get('guid') and m['guid'] == user_guid:
+                            return t.get('team_key')
+
+            # Last resort: return first team key (not ideal but unblocks flows)
+            return teams[0].get('team_key')
+        except Exception as e:
+            logger.error(f"Failed to determine user's team in league {league_key}: {e}")
+            return None
+
+    async def get_user_team_roster(self, league_key: str, week: int = None) -> Dict[str, Any]:
+        """Get the current user's roster for the specified league and optional week."""
+        team_key = await self.get_user_team_key(league_key)
+        if not team_key:
+            raise Exception("Could not determine user's team in this league")
+
+        roster = await self.get_roster(league_key, team_key, week)
+
+        # Enrich with team name
+        try:
+            teams = await self.get_league_teams(league_key)
+            team = next((t for t in teams if t.get('team_key') == team_key), None)
+            if team:
+                roster['team_key'] = team_key
+                roster['team_name'] = team.get('name')
+        except Exception:
+            pass
+
+        return roster
     
     async def get_matchup(self, league_key: str, team_key: str, week: int) -> Dict[str, Any]:
         """
@@ -460,20 +589,38 @@ class DataFetcherAgent:
                 endpoint=APIEndpoint.AVAILABLE_PLAYERS,
                 params={
                     "league_key": league_key,
+                    "count": count,
                     "position": position,
-                    "status": status,
-                    "count": count
+                    "status": status
                 }
             )
             
             players_data = await self._make_api_request(request)
             
-            # Transform players data
-            available_players = []
-            if players_data and hasattr(players_data, 'players'):
-                for player in players_data.players:
+            # Transform players data and filter to available
+            available_players: List[Dict[str, Any]] = []
+            requested_pos = position
+            if players_data:
+                if hasattr(players_data, 'players'):
+                    iterable = players_data.players
+                elif isinstance(players_data, list):
+                    iterable = players_data
+                else:
+                    iterable = []
+                for player in iterable:
                     player_info = await self._transform_yahoo_player(player)
-                    available_players.append(player_info)
+                    # Filter by position if requested
+                    if requested_pos and player_info.get('position') != requested_pos:
+                        continue
+                    # Filter by availability: include if not on a team
+                    own = (player_info.get('ownership_status') or '').lower()
+                    if own in ('freeagents', 'free agent', 'fa', 'available', ''):
+                        # normalize projected points
+                        try:
+                            player_info['projected_points'] = float(player_info.get('projected_points') or 0)
+                        except Exception:
+                            player_info['projected_points'] = 0.0
+                        available_players.append(player_info)
             
             # Cache with short TTL since player availability changes rapidly
             await self.cache_manager.set(
@@ -779,6 +926,12 @@ class DataFetcherAgent:
                 game_key = request.params.get("game_key", "nfl")  # Default to current NFL season
                 return self._yahoo_client.get_user_leagues_by_game_key(game_key)
             
+            elif request.endpoint == APIEndpoint.LEAGUE_TEAMS:
+                league_key = request.params["league_key"]
+                # Set league context
+                self._yahoo_client.league_id = league_key.split(".")[-1]
+                return self._yahoo_client.get_league_teams()
+            
             elif request.endpoint == APIEndpoint.TEAM_ROSTER:
                 league_key = request.params["league_key"]
                 team_key = request.params["team_key"]
@@ -787,14 +940,15 @@ class DataFetcherAgent:
                 # Set league context
                 self._yahoo_client.league_id = league_key.split(".")[-1]
                 
+                team_id = team_key.split(".")[-1]
                 if week:
-                    return self._yahoo_client.get_team_roster_player_info_by_week(
-                        team_id=team_key.split(".")[-1], 
+                    return self._yahoo_client.get_team_roster_player_stats_by_week(
+                        team_id=team_id,
                         chosen_week=week
                     )
                 else:
-                    return self._yahoo_client.get_team_roster_player_info(
-                        team_id=team_key.split(".")[-1]
+                    return self._yahoo_client.get_team_roster_player_stats(
+                        team_id=team_id
                     )
             
             elif request.endpoint == APIEndpoint.TEAM_MATCHUP:
@@ -815,14 +969,11 @@ class DataFetcherAgent:
             elif request.endpoint == APIEndpoint.AVAILABLE_PLAYERS:
                 league_key = request.params["league_key"]
                 self._yahoo_client.league_id = league_key.split(".")[-1]
-                
+                count = request.params.get("count", 25)
+                # Use generic league players; we'll filter client-side by ownership/position
                 return self._yahoo_client.get_league_players(
-                    player_count_limit=request.params.get("count", 25),
-                    player_count_start=0,
-                    search_filters={
-                        "position": request.params.get("position"),
-                        "status": request.params.get("status", "A")
-                    }
+                    player_count_limit=count,
+                    player_count_start=0
                 )
             
             else:
@@ -854,7 +1005,11 @@ class DataFetcherAgent:
             }
             
             # Map Yahoo team to our Team enum
-            yahoo_team = getattr(yahoo_player, 'editorial_team_abbr', '') or getattr(yahoo_player, 'team_abbr', '')
+            yahoo_team = (
+                getattr(yahoo_player, 'editorial_team_abbr', '')
+                or getattr(yahoo_player, 'team_abbr', '')
+                or getattr(getattr(yahoo_player, 'team', object()), 'abbr', '')
+            )
             nfl_team = None
             try:
                 nfl_team = NFLTeam(yahoo_team.upper()) if yahoo_team else None
@@ -862,18 +1017,71 @@ class DataFetcherAgent:
                 logger.warning(f"Unknown NFL team: {yahoo_team}")
             
             # Basic player information
+            # Name resolution
+            name_obj = getattr(yahoo_player, 'name', None)
+            full_name = None
+            if name_obj is not None:
+                full_name = (
+                    getattr(name_obj, 'full', None)
+                    or (f"{getattr(name_obj, 'first', '')} {getattr(name_obj, 'last', '')}".strip())
+                )
+            if not full_name:
+                full_name = getattr(yahoo_player, 'display_name', None) or 'Unknown Player'
+
             player_info = {
-                'player_key': yahoo_player.player_key,
-                'name': f"{yahoo_player.name.first} {yahoo_player.name.last}",
-                'position': getattr(yahoo_player, 'primary_position', ''),
+                'player_key': getattr(yahoo_player, 'player_key', ''),
+                'name': full_name,
+                'position': (
+                    getattr(yahoo_player, 'display_position', '')
+                    or getattr(yahoo_player, 'primary_position', '')
+                    or getattr(yahoo_player, 'position', '')
+                ),
                 'team': yahoo_team,
                 'jersey_number': getattr(yahoo_player, 'jersey_number', None),
-                'bye_weeks': getattr(yahoo_player, 'bye_weeks', []),
+                'bye_weeks': None,
                 'is_undroppable': getattr(yahoo_player, 'is_undroppable', False),
-                'ownership_status': getattr(yahoo_player, 'ownership', {}).get('ownership_type', 'available'),
-                'percent_owned': getattr(yahoo_player, 'percent_owned', None)
+                'ownership_status': None,
+                'percent_owned': None
             }
+
+            # Ownership model may be an object, not dict
+            ownership = getattr(yahoo_player, 'ownership', None)
+            if ownership is not None:
+                try:
+                    player_info['ownership_status'] = getattr(ownership, 'ownership_type', None) or (
+                        ownership.get('ownership_type') if isinstance(ownership, dict) else None
+                    )
+                except Exception:
+                    pass
+
+            # Percent owned normalization
+            po = getattr(yahoo_player, 'percent_owned', None)
+            if po is not None:
+                try:
+                    player_info['percent_owned'] = (
+                        float(po) if isinstance(po, (int, float, str)) and str(po).replace('.', '', 1).isdigit()
+                        else float(getattr(po, 'value', None)) if hasattr(po, 'value') and isinstance(getattr(po, 'value'), (int, float, str)) and str(getattr(po, 'value')).replace('.', '', 1).isdigit()
+                        else None
+                    )
+                except Exception:
+                    player_info['percent_owned'] = None
             
+            # Normalize bye weeks if present
+            if hasattr(yahoo_player, 'bye_weeks') and yahoo_player.bye_weeks:
+                try:
+                    bw = yahoo_player.bye_weeks
+                    if isinstance(bw, (list, tuple)):
+                        player_info['bye_weeks'] = list(bw)
+                    else:
+                        # Attempt to read common attributes
+                        player_info['bye_weeks'] = list(getattr(bw, 'weeks', [])) or [
+                            getattr(bw, 'week', None)
+                        ]
+                except Exception:
+                    player_info['bye_weeks'] = []
+            else:
+                player_info['bye_weeks'] = []
+
             # Injury information
             if hasattr(yahoo_player, 'status') and yahoo_player.status:
                 player_info['injury_status'] = yahoo_player.status
@@ -881,14 +1089,32 @@ class DataFetcherAgent:
                 player_info['injury_status'] = 'Healthy'
             
             if hasattr(yahoo_player, 'injury_note'):
-                player_info['injury_note'] = yahoo_player.injury_note
+                try:
+                    note = getattr(yahoo_player, 'injury_note')
+                    player_info['injury_note'] = str(note) if note is not None else None
+                except Exception:
+                    pass
             
             # Statistics if available
             if hasattr(yahoo_player, 'player_stats') and yahoo_player.player_stats:
                 stats = {}
-                for stat in yahoo_player.player_stats.stats:
-                    stats[stat.stat.display_name] = stat.value
-                player_info['stats'] = stats
+                try:
+                    for s in getattr(yahoo_player.player_stats, 'stats', []) or []:
+                        try:
+                            stat_meta = getattr(s, 'stat', None)
+                            name = None
+                            if stat_meta is not None:
+                                name = getattr(stat_meta, 'display_name', None) or getattr(stat_meta, 'name', None)
+                            if not name:
+                                name = f"stat_{getattr(s, 'stat_id', getattr(stat_meta, 'stat_id', 'unknown'))}"
+                            value = getattr(s, 'value', None)
+                            stats[name] = value
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+                if stats:
+                    player_info['stats'] = stats
             
             # Projected points if available
             if hasattr(yahoo_player, 'player_points') and yahoo_player.player_points:
