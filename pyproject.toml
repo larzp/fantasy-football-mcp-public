@@ -7,10 +7,10 @@ name = "fantasy-football-mcp"
 version = "1.0.0"
 description = "Production-grade MCP server for Yahoo Fantasy Sports with sophisticated lineup optimization"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
-    {name = "Fantasy Football MCP Contributors", email = ""}
+    {name = "Fantasy Football MCP Contributors", email = "contributors@example.com"}
 ]
 keywords = [
     "fantasy-football",
