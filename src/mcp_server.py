@@ -9,27 +9,27 @@ import asyncio
 import json
 import os
 import sys
-from typing import Any, Dict, List, Optional, Union
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
 
+from dotenv import load_dotenv
+from loguru import logger
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field
-from loguru import logger
-from dotenv import load_dotenv
 
-from .agents.data_fetcher import DataFetcherAgent
-from .agents.statistical import StatisticalAnalysisAgent
-from .agents.optimization import OptimizationAgent
-from .agents.decision import DecisionAgent
-from .agents.cache_manager import CacheManagerAgent
-from .agents.reddit_analyzer import RedditSentimentAgent
 from .agents.auto_token_manager import AutoTokenManager, get_auto_token_manager
-from .models.player import Player
+from .agents.cache_manager import CacheManagerAgent
+from .agents.data_fetcher import DataFetcherAgent
+from .agents.decision import DecisionAgent
+from .agents.optimization import OptimizationAgent
+from .agents.reddit_analyzer import RedditSentimentAgent
+from .agents.statistical import StatisticalAnalysisAgent
 from .models.lineup import Lineup, LineupRecommendation
 from .models.matchup import Matchup, MatchupAnalysis
+from .models.player import Player
 from .utils.constants import POSITIONS, ROSTER_POSITIONS
-import sys
+
 sys.path.append('..')
 
 # Try to import settings, fall back to minimal config if it fails
@@ -37,8 +37,9 @@ try:
     from config.settings import Settings
 except Exception as e:
     logger.warning(f"Could not load full settings: {e}. Using minimal config.")
-    from pydantic_settings import BaseSettings
     from pathlib import Path
+
+    from pydantic_settings import BaseSettings
     
     class Settings(BaseSettings):
         """Minimal settings class for MCP server."""
@@ -75,9 +76,9 @@ class FantasyFootballService:
         try:
             self.cache_manager = CacheManagerAgent(self.settings)
             self.data_fetcher = DataFetcherAgent(self.settings, self.cache_manager)
-            self.statistical = StatisticalAnalysisAgent(self.settings)
-            self.optimization = OptimizationAgent(self.settings)
-            self.decision = DecisionAgent(self.settings)
+            self.statistical = StatisticalAnalysisAgent(max_workers=4)
+            self.optimization = OptimizationAgent(max_workers=4)
+            self.decision = DecisionAgent()
             self.reddit_sentiment = RedditSentimentAgent(self.settings)
         except Exception as e:
             logger.warning(f"Could not initialize all agents: {e}. Some features may be limited.")

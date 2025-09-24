@@ -7,23 +7,29 @@ and intelligent caching through the cache manager.
 """
 
 import asyncio
-import json
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Union, Tuple
-from dataclasses import dataclass
-from enum import Enum
 import hashlib
+import json
 import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import aiohttp
 from loguru import logger
 from yfpy import YahooFantasySportsQuery
-from yfpy.models import Game, League, Team, Player as YfpyPlayer, Roster, Matchup
+from yfpy.models import Game, League, Matchup
+from yfpy.models import Player as YfpyPlayer
+from yfpy.models import Roster, Team
 
 from config.settings import Settings
-from ..models.player import Player, Position, Team as NFLTeam, InjuryReport, InjuryStatus, PlayerStats
-from ..models.matchup import Matchup as FantasyMatchup, GameStatus
+
 from ..models.lineup import Lineup
+from ..models.matchup import GameStatus
+from ..models.matchup import Matchup as FantasyMatchup
+from ..models.player import (InjuryReport, InjuryStatus, Player, PlayerStats,
+                             Position)
+from ..models.player import Team as NFLTeam
 from .cache_manager import CacheManagerAgent
 
 
@@ -196,26 +202,27 @@ class DataFetcherAgent:
             # Make API request
             request = APIRequest(
                 endpoint=APIEndpoint.USER_LEAGUES,
-                params={"game_key": game_key} if game_key else {}
+                params={"game_key": game_key or "nfl"}  # Default to current NFL season
             )
             
             leagues_data = await self._make_api_request(request)
             
             # Transform to our format
             leagues = []
-            if leagues_data and hasattr(leagues_data, 'leagues'):
-                for league in leagues_data.leagues:
+            if leagues_data:
+                # leagues_data is a list of League objects directly
+                for league in leagues_data:
                     league_info = {
-                        'league_id': league.league_id,
-                        'league_key': league.league_key,
-                        'name': league.name,
-                        'game_key': league.game_key,
-                        'season': league.season,
+                        'league_id': getattr(league, 'league_id', None),
+                        'league_key': getattr(league, 'league_key', None),
+                        'name': getattr(league, 'name', 'Unknown').decode() if isinstance(getattr(league, 'name', ''), bytes) else getattr(league, 'name', 'Unknown'),
+                        'season': getattr(league, 'season', None),
                         'is_finished': getattr(league, 'is_finished', False),
                         'num_teams': getattr(league, 'num_teams', None),
                         'scoring_type': getattr(league, 'scoring_type', None),
                         'league_type': getattr(league, 'league_type', None),
-                        'url': getattr(league, 'url', None)
+                        'url': getattr(league, 'url', None),
+                        'current_week': getattr(league, 'current_week', None)
                     }
                     leagues.append(league_info)
             
@@ -671,13 +678,29 @@ class DataFetcherAgent:
         """Initialize Yahoo Fantasy Sports API client."""
         try:
             # Create Yahoo API client with OAuth2 credentials
+            import os
+            from pathlib import Path
+
+            # Build access token dict manually from our environment variables
+            # Include consumer key and secret in the token data as required by yfpy
+            access_token_data = {
+                "access_token": os.getenv("YAHOO_ACCESS_TOKEN", "").strip("'\""),
+                "refresh_token": os.getenv("YAHOO_REFRESH_TOKEN", "").strip("'\""),
+                "token_type": os.getenv("YAHOO_TOKEN_TYPE", "bearer"),
+                "token_time": float(os.getenv("YAHOO_TOKEN_TIME", "0")),
+                "guid": os.getenv("YAHOO_GUID", ""),
+                "consumer_key": os.getenv("YAHOO_CONSUMER_KEY"),
+                "consumer_secret": os.getenv("YAHOO_CONSUMER_SECRET")
+            }
+            
+            # Initialize with minimal required parameters for user league queries
             self._yahoo_client = YahooFantasySportsQuery(
-                league_id=None,  # Will be set per request
+                league_id="1",  # Dummy value, will be updated per request
                 game_code="nfl",
                 game_id=None,  # Will be determined from current season
-                yahoo_consumer_key=self.settings.yahoo_client_id,
-                yahoo_consumer_secret=self.settings.yahoo_client_secret,
-                env_file_location=".env"  # OAuth tokens stored here
+                yahoo_access_token_json=access_token_data,
+                env_var_fallback=False,  # Don't fall back since we're passing tokens directly
+                browser_callback=False  # Disable browser popup since we handle auth separately
             )
             
             logger.info("Yahoo API client initialized")
@@ -752,7 +775,9 @@ class DataFetcherAgent:
             
             # Route to appropriate Yahoo API method
             if request.endpoint == APIEndpoint.USER_LEAGUES:
-                return self._yahoo_client.get_user_leagues()
+                # Use the correct method name and pass game key for current NFL season
+                game_key = request.params.get("game_key", "nfl")  # Default to current NFL season
+                return self._yahoo_client.get_user_leagues_by_game_key(game_key)
             
             elif request.endpoint == APIEndpoint.TEAM_ROSTER:
                 league_key = request.params["league_key"]
